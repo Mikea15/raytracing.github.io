@@ -93,7 +93,8 @@ body {
 }
 
 .md pre.listing.tilde code {
-    font-size: 86%;
+    font-size: 85%;
+    letter-spacing: -0.20;
     margin-left: 0;
 }
 
