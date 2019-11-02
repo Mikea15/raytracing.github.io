@@ -87,15 +87,14 @@ body {
 .md pre.listing.tilde {
     border: solid 3px #d4d4d4;
     background: #e4e4e0;
-    margin-left: 3ex;
     padding: 1.5ex;
-    width: 94%;
+    width: 96%;
+    overflow: visible;
 }
 
 .md pre.listing.tilde code {
-    font-size: 85%;
+    font-size: 86%;
     letter-spacing: -0.20;
-    margin-left: 0;
 }
 
 /* Hilight.js Syntax Coloring */
