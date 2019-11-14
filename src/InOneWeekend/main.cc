@@ -125,7 +125,7 @@ int main() {
 		}
 	}
 
-	auto timeSpan = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - fulltime);
+	auto timeSpan = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - fulltime);
 	int frameTimeMs = static_cast<int>(timeSpan.count());
 	std::cout << " - time " << frameTimeMs << " ms \n";
 
