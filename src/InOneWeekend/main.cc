@@ -21,6 +21,12 @@
 #include <fstream>
 #include <chrono>
 #include <string>
+#include <mutex>
+#include <future>
+
+#include <list>
+#include <queue>
+#include <vector>
 
 vec3 color(const ray& r, hittable* world, int depth) {
 	hit_record rec;
@@ -83,11 +89,17 @@ hittable* random_scene() {
 	return new hittable_list(list, i);
 }
 
+struct RayResult
+{
+	unsigned int index;
+	vec3 col;
+};
 
 int main() {
 	int nx = 1200;
 	int ny = 800;
-	int ns = 10;
+	int ns = 4;
+	const int pixelCount = nx * ny;
 	// std::cout << "P3\n" << nx << " " << ny << "\n255\n";
 	hittable* world = random_scene();
 
@@ -103,38 +115,70 @@ int main() {
 
 	auto fulltime = std::chrono::high_resolution_clock::now();
 
+	std::mutex mutex;
+	std::condition_variable cvResults;
+	std::vector<std::future<RayResult>> m_futures;
+
 	// for (int j = ny-1; j >= 0; j--) {
 	for (int j = 0; j < ny; ++j) {
 		for (int i = 0; i < nx; ++i) {
-			vec3 col(0, 0, 0);
-			for (int s = 0; s < ns; ++s) {
-				float u = float(i + random_double()) / float(nx);
-				float v = float(j + random_double()) / float(ny);
-				ray r = cam.get_ray(u, v);
-				col += color(r, world, 0);
+			
+
+			auto future = std::async(std::launch::async | std::launch::deferred, 
+				[&cam, &world, &ns, i, j, nx, ny, &cvResults]() -> RayResult {
+				const unsigned int index = j * nx + i;
+				vec3 col(0, 0, 0);
+				for (int s = 0; s < ns; ++s) {
+					float u = float(i + random_double()) / float(nx);
+					float v = float(j + random_double()) / float(ny);
+
+					ray r = cam.get_ray(u, v);
+					col += color(r, world, 0);
+				}
+				col /= float(ns);
+
+				RayResult result;
+				result.index = index;
+				result.col = vec3(sqrt(col[0]), sqrt(col[1]), sqrt(col[2]));
+				return result;
+			});
+
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				m_futures.push_back(std::move(future));
 			}
-			col /= float(ns);
-			col = vec3(sqrt(col[0]), sqrt(col[1]), sqrt(col[2]));
-
-			const unsigned int index = j * nx + i;
-			image[index] = col;
-
-			// int ir = int(255.99*col[0]);
-			// int ig = int(255.99*col[1]);
-			// int ib = int(255.99*col[2]);
 		}
 	}
 
-	auto timeSpan = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - fulltime);
-	float frameTimeMs = static_cast<int>(timeSpan.count());
+	auto timeout = std::chrono::milliseconds(10);
+	
+	// launched jobs. need to build image.
+	// wait for number of jobs = pixel count
+	{
+		std::unique_lock<std::mutex> lock(mutex);
+		cvResults.wait(lock, [&m_futures, &pixelCount] {
+			return m_futures.size() == pixelCount;
+		});
+	}
+
+	// reconstruct image.
+	for (std::future<RayResult>& rr : m_futures)
+	{
+		RayResult result = rr.get();
+		image[result.index] = result.col;
+	}
+
+	auto timeSpan = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - fulltime);
+	int frameTimeMs = static_cast<int>(timeSpan.count());
 	std::cout << " - time " << frameTimeMs << " ms \n";
 
-	std::string filename = 
-		"out-x" + std::to_string(nx) 
-		+ "-y" + std::to_string(ny) 
-		+ "-s" + std::to_string(ns) 
+	std::string filename =
+		"jobs-x" + std::to_string(nx)
+		+ "-y" + std::to_string(ny)
+		+ "-s" + std::to_string(ns)
 		+ "-ms" + std::to_string(frameTimeMs) + ".ppm";
 
+	// write image.
 	std::ofstream fileHandler;
 	fileHandler.open(filename, std::ios::out | std::ios::binary);
 	if (!fileHandler.is_open())
@@ -159,6 +203,7 @@ int main() {
 	std::cout << "File Saved" << std::endl;
 	fileHandler.close();
 
+	// free and exit
 	delete[] image;
 	return 0;
 }
