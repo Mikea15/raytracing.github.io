@@ -98,7 +98,7 @@ struct RayResult
 int main() {
 	int nx = 1200;
 	int ny = 800;
-	int ns = 4;
+	int ns = 10;
 	const int pixelCount = nx * ny;
 	// std::cout << "P3\n" << nx << " " << ny << "\n255\n";
 	hittable* world = random_scene();
