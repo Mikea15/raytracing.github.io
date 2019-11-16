@@ -89,10 +89,14 @@ hittable* random_scene() {
 	return new hittable_list(list, i);
 }
 
-struct RayResult
+struct BlockJob
 {
-	unsigned int index;
-	vec3 col;
+	int rowStart = 0;
+	int rowEnd = 0;
+	int colSize;
+	int spp;
+	std::vector<int> indices;
+	std::vector<vec3> colors;
 };
 
 int main() {
@@ -115,57 +119,82 @@ int main() {
 
 	auto fulltime = std::chrono::high_resolution_clock::now();
 
+	const int nThreads = std::thread::hardware_concurrency();
+	int nRowsPerJob = 10;
+	int nJobs = ny / nRowsPerJob; // 1 row per job
+	int leftOver = ny % nThreads;
+
 	std::mutex mutex;
 	std::condition_variable cvResults;
-	std::vector<std::future<RayResult>> m_futures;
+	std::vector<BlockJob> imageBlocks;
+	std::vector<std::future<void>> m_futures;
 
-	// for (int j = ny-1; j >= 0; j--) {
-	for (int j = 0; j < ny; ++j) {
-		for (int i = 0; i < nx; ++i) {
-			
+	for (int i = 0; i < nJobs; ++i)
+	{
+		auto future = std::async(std::launch::async | std::launch::deferred,
+			[nRowsPerJob, leftOver, nThreads, &imageBlocks,
+			ny, nx, ns, i, &cam, &world, &mutex, &cvResults]() {
 
-			auto future = std::async(std::launch::async | std::launch::deferred, 
-				[&cam, &world, &ns, i, j, nx, ny, &cvResults]() -> RayResult {
-				const unsigned int index = j * nx + i;
-				vec3 col(0, 0, 0);
-				for (int s = 0; s < ns; ++s) {
-					float u = float(i + random_double()) / float(nx);
-					float v = float(j + random_double()) / float(ny);
-
-					ray r = cam.get_ray(u, v);
-					col += color(r, world, 0);
+				BlockJob job;
+				job.rowStart = i * nRowsPerJob;
+				job.rowEnd = job.rowStart + nRowsPerJob;
+				if (i == nThreads - 1)
+				{
+					job.rowEnd = job.rowStart + nRowsPerJob + leftOver;
 				}
-				col /= float(ns);
+				job.colSize = nx;
+				job.spp = ns;
 
-				RayResult result;
-				result.index = index;
-				result.col = vec3(sqrt(col[0]), sqrt(col[1]), sqrt(col[2]));
-				return result;
+				for (int j = job.rowStart; j < job.rowEnd; ++j) {
+					for (int i = 0; i < job.colSize; ++i) {
+						vec3 col(0, 0, 0);
+						for (int s = 0; s < job.spp; ++s) {
+							float u = float(i + random_double()) / float(job.colSize);
+							float v = float(j + random_double()) / float(ny);
+							ray r = cam.get_ray(u, v);
+							col += color(r, world, 0);
+						}
+						col /= float(job.spp);
+						col = vec3(sqrt(col[0]), sqrt(col[1]), sqrt(col[2]));
+
+						const unsigned int index = j * job.colSize + i;
+						job.indices.push_back(index);
+						job.colors.push_back(col);
+					}
+				}
+
+				{
+					std::lock_guard<std::mutex> lock(mutex);
+					imageBlocks.push_back(job);
+					cvResults.notify_one();
+				}
 			});
 
-			{
-				std::lock_guard<std::mutex> lock(mutex);
-				m_futures.push_back(std::move(future));
-			}
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			m_futures.push_back(std::move(future));
 		}
 	}
 
-	auto timeout = std::chrono::milliseconds(10);
-	
 	// launched jobs. need to build image.
 	// wait for number of jobs = pixel count
 	{
 		std::unique_lock<std::mutex> lock(mutex);
-		cvResults.wait(lock, [&m_futures, &pixelCount] {
-			return m_futures.size() == pixelCount;
-		});
+		cvResults.wait(lock, [&m_futures, &imageBlocks] {
+			return m_futures.size() == imageBlocks.size();
+			});
 	}
 
-	// reconstruct image.
-	for (std::future<RayResult>& rr : m_futures)
+	for (BlockJob job : imageBlocks)
 	{
-		RayResult result = rr.get();
-		image[result.index] = result.col;
+		int index = job.rowStart;
+		int colorIndex = 0;
+		for (vec3& col : job.colors)
+		{
+			int colIndex = job.indices[colorIndex];
+			image[colIndex] = col;
+			++colorIndex;
+		}
 	}
 
 	auto timeSpan = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - fulltime);
@@ -173,10 +202,10 @@ int main() {
 	std::cout << " - time " << frameTimeMs << " ms \n";
 
 	std::string filename =
-		"jobs-x" + std::to_string(nx)
+		"jobs-blocks-x" + std::to_string(nx)
 		+ "-y" + std::to_string(ny)
 		+ "-s" + std::to_string(ns)
-		+ "-ms" + std::to_string(frameTimeMs) + ".ppm";
+		+ "-" + std::to_string(frameTimeMs) + "sec.ppm";
 
 	// write image.
 	std::ofstream fileHandler;
