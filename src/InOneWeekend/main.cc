@@ -26,6 +26,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <queue>
 
 vec3 color(const ray& r, hittable* world, int depth) {
 	hit_record rec;
@@ -92,8 +93,8 @@ std::mutex writeM;
 
 struct BlockJob
 {
-	int rowStart;
-	int rowEnd;
+	int rowStart = 0;
+	int rowEnd = 0;
 	int colSize;
 	int spp;
 	std::vector<int> indices;
@@ -101,7 +102,7 @@ struct BlockJob
 };
 
 void CalculateColor(BlockJob job, std::vector<BlockJob>& imageBlocks, int ny, camera cam, hittable* world,
-	std::mutex& mutex, std::condition_variable& cv, std::atomic<int>& completedThreads)
+	std::mutex& mutex, std::condition_variable& cv)
 {
 	for (int j = job.rowStart; j < job.rowEnd; ++j) {
 		for (int i = 0; i < job.colSize; ++i) {
@@ -124,7 +125,43 @@ void CalculateColor(BlockJob job, std::vector<BlockJob>& imageBlocks, int ny, ca
 	{
 		std::lock_guard<std::mutex> lock(mutex);
 		imageBlocks.push_back(job);
-		completedThreads++;
+	}
+}
+
+void ThreadJobLoop(
+	int ny, camera cam, hittable* world,
+	std::queue<BlockJob>& jobQ, 
+	std::vector<BlockJob>& finishedJobs, 
+	std::mutex& mutex,
+	std::condition_variable& cv
+	)
+{
+	std::atomic<bool> hasWork{ true };
+	while (hasWork)
+	{
+		BlockJob job;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (!jobQ.empty())
+			{
+				job = jobQ.front();
+				jobQ.pop();
+			}
+		}
+		// quick/dirty way to find if a job is valid
+		if (job.rowStart < job.rowEnd)
+		{
+			CalculateColor(job, finishedJobs, ny, cam, world, mutex, cv);
+		}
+		else
+		{
+			hasWork = false;
+		}
+	}
+
+	// no more jobs.
+	{
+		std::lock_guard<std::mutex> lock(mutex);
 		cv.notify_one();
 	}
 }
@@ -150,39 +187,49 @@ int main() {
 	auto fulltime = std::chrono::high_resolution_clock::now();
 
 	const int nThreads = std::thread::hardware_concurrency();
-	int rowsPerThread = ny / nThreads;
+	int nRowsPerJob = 200;
+	int nJobs = ny / nRowsPerJob; // 1 row per job
 	int leftOver = ny % nThreads;
 
 	std::mutex mutex;
 	std::condition_variable cvResults;
 	std::vector<BlockJob> imageBlocks;
-	std::atomic<int> completedThreads = { 0 };
+	std::queue<BlockJob> jobQueue;
 	std::vector<std::thread> threads;
 
-	for (int i = 0; i < nThreads; ++i)
+	for (int i = 0; i < nJobs; ++i)
 	{
 		BlockJob job;
-		job.rowStart = i * rowsPerThread;
-		job.rowEnd = job.rowStart + rowsPerThread;
-		if (i == nThreads - 1) 
+		job.rowStart = i * nRowsPerJob;
+		job.rowEnd = job.rowStart + nRowsPerJob;
+		if (i == nThreads - 1)
 		{
-			job.rowEnd = job.rowStart + rowsPerThread + leftOver;
+			job.rowEnd = job.rowStart + nRowsPerJob + leftOver;
 		}
 		job.colSize = nx;
 		job.spp = ns;
 
-		std::thread t([job, &imageBlocks, ny, &cam, &world, &mutex, &cvResults, &completedThreads]() {
-			CalculateColor(job, imageBlocks, ny, cam, world, mutex, cvResults, completedThreads);
+		jobQueue.push(job);
+	}
+
+	// last processing thread, is the main thread.
+	for (int i = 0; i < nThreads - 1; ++i)
+	{
+		std::thread t([&]() {
+			ThreadJobLoop(ny, cam, world, jobQueue, imageBlocks, mutex, cvResults);
 		});
 		threads.push_back(std::move(t));
 	}
+
+	// main thread loop
+	ThreadJobLoop(ny, cam, world, jobQueue, imageBlocks, mutex, cvResults);
 
 	// launched jobs. need to build image.
 	// wait for number of jobs = pixel count
 	{
 		std::unique_lock<std::mutex> lock(mutex);
-		cvResults.wait(lock, [&completedThreads, &nThreads] {
-			return completedThreads == nThreads;
+		cvResults.wait(lock, [&imageBlocks, &nJobs] {
+			return imageBlocks.size() == nJobs;
 		});
 	}
 
@@ -208,7 +255,7 @@ int main() {
 	std::cout << " - time " << frameTimeMs << " ms \n";
 
 	std::string filename = 
-		"block-x" + std::to_string(nx) 
+		"block-jobq-x" + std::to_string(nx) 
 		+ "-y" + std::to_string(ny) 
 		+ "-s" + std::to_string(ns) 
 		+ "-" + std::to_string(frameTimeMs) + "sec.ppm";
